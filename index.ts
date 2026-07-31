@@ -292,6 +292,106 @@ export function trimSnippet(text: string, max = 80): string {
 	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
+// Hint generation: fast/cheap models explain what the command does and why
+// it is risky. Best-effort — the prompt still shows if this fails.
+const HINT_MODELS: Array<[string, string]> = [
+	["cliproxyapi", "grok-4.5"],
+	["cliproxyapi", "gpt-5.6-luna"],
+];
+const HINT_TIMEOUT_MS = 12_000;
+
+// biome-ignore lint/suspicious/noExplicitAny: pi-ai types resolved at runtime
+type HintCtx = {
+	modelRegistry?: {
+		find(provider: string, id: string): any;
+		getProvider(provider: string): any;
+		getApiKeyAndHeaders(model: unknown): Promise<{
+			ok: boolean;
+			apiKey?: string;
+			headers?: Record<string, string>;
+			env?: Record<string, string>;
+		}>;
+	};
+};
+
+// Temporary debug log for hint generation failures.
+function hintLog(message: string): void {
+	try {
+		writeFileSync(
+			join(homedir(), ".pi", "agent", "destructive-command-guard-hint.log"),
+			`${new Date().toISOString()} ${message}\n`,
+			{ flag: "a" },
+		);
+	} catch {}
+}
+
+async function generateHint(
+	ctx: HintCtx,
+	command: string,
+): Promise<string | undefined> {
+	if (!ctx.modelRegistry) {
+		hintLog("no modelRegistry on ctx");
+		return undefined;
+	}
+	const prompt = `You are a shell-safety assistant. In at most 2 short sentences, explain what this command does and why it might be dangerous (what could be lost or broken). Plain text only, no markdown.\n\nCommand:\n${command.slice(0, 4000)}`;
+	for (const [provider, id] of HINT_MODELS) {
+		try {
+			const { uuidv7 } = await import("@earendil-works/pi-ai");
+			const model = ctx.modelRegistry.find(provider, id);
+			if (!model) {
+				hintLog(`model not found: ${provider}/${id}`);
+				continue;
+			}
+			const providerImpl = ctx.modelRegistry.getProvider(provider);
+			if (!providerImpl?.streamSimple) {
+				hintLog(`no streamSimple on provider: ${provider}`);
+				continue;
+			}
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok || !auth.apiKey) {
+				hintLog(`auth failed for ${provider}/${id}`);
+				continue;
+			}
+			const response = await providerImpl
+				.streamSimple(
+					model,
+					{
+						messages: [
+							{
+								role: "user" as const,
+								content: [{ type: "text" as const, text: prompt }],
+								timestamp: Date.now(),
+							},
+						],
+					},
+					{
+						apiKey: auth.apiKey,
+						headers: auth.headers,
+						env: auth.env,
+						maxTokens: 512,
+						reasoning: "low",
+						cacheRetention: "none",
+						sessionId: uuidv7(),
+						signal: AbortSignal.timeout(HINT_TIMEOUT_MS),
+					},
+				)
+				.result();
+			const text = response.content
+				.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+				.map((c: { text: string }) => c.text)
+				.join("\n")
+				.trim();
+			if (text) return text;
+			hintLog(`empty hint from ${provider}/${id}`);
+		} catch (error) {
+			hintLog(
+				`${provider}/${id}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+			);
+		}
+	}
+	return undefined;
+}
+
 function extractCommand(toolName: string, input: unknown): string | undefined {
 	if (
 		!COMMAND_TOOLS.has(toolName.toLowerCase()) ||
@@ -337,6 +437,8 @@ export default function (pi: ExtensionAPI) {
 		const truncated = shortPreview !== command.trim();
 
 		pi.events.emit("warp-pi-notify:approval-required", {});
+		const hint = await generateHint(ctx as unknown as HintCtx, command);
+		const hintBlock = hint ? `\nHint: ${hint}\n` : "";
 		let showFull = false;
 		for (;;) {
 			const options = [
@@ -347,7 +449,7 @@ export default function (pi: ExtensionAPI) {
 				"Deny",
 			];
 			const choice = await ctx.ui.select(
-				`Destructive command\nTool: ${event.toolName}\n\n${showFull ? fullPreview : shortPreview}\n\nAllow this command?`,
+				`Destructive command\nTool: ${event.toolName}\n\n${showFull ? fullPreview : shortPreview}\n${hintBlock}\nAllow this command?`,
 				options,
 			);
 
