@@ -40,15 +40,35 @@ const SAFE_WORKTREE_RM = re(
 	"",
 );
 
+// Command position: start of string/segment (incl. inside quotes for ssh/bash -c
+// payloads), optionally preceded by env assignments and benign wrappers. Bare
+// destructive tokens in argument/data position no longer match.
+const CMD_POS = String.raw`(?:^|[\n;&|'"\`(])[ \t]*(?:(?:command|builtin|nohup|time|nice|env|exec|timeout[ \t]+\S+|[A-Za-z_][A-Za-z0-9_]*=[^\s'"]*)[ \t]+)*(?:\/(?:usr\/)?(?:local\/)?(?:s?bin\/)?)?`;
+
 // Filesystem / system
 const FILESYSTEM = [
-	re(String.raw`\b${EXE}(?:rm|rmdir|unlink|shred|truncate)\b`),
-	re(String.raw`\b${EXE}find\b[\s\S]*\s-delete\b`),
-	re(String.raw`\b${EXE}(?:dd|mkfs(?:\.\w+)?)\b`),
+	re(String.raw`${CMD_POS}(?:rm|rmdir|unlink|shred|truncate)\b`),
+	re(String.raw`${CMD_POS}find\b[\s\S]*\s-delete\b`),
+	re(String.raw`${CMD_POS}dd[ \t]+\S`, ""),
+	re(String.raw`${CMD_POS}mkfs(?:\.\w+)?\b`),
 	re(
 		String.raw`\b${EXE}diskutil\b.*\b(?:erase|partition|reformat|unmountForce|apfs\s+delete)\b`,
 	),
-	re(String.raw`\b${EXE}(?:sudo|chmod|chown)\b`),
+	// chmod/chown: only clearly risky forms (world-writable, recursive chown,
+	// chown to root, sensitive filenames). chmod +x / 644 on own files is allowed.
+	re(
+		String.raw`${CMD_POS}chmod\b[^\n;|&]*(?:\b[0-7]?777\b|\b[0-7]?666\b|\b[augo]*[oa][+=][rwxst]*w)`,
+	),
+	re(
+		String.raw`${CMD_POS}chown\b[^\n;|&]*[ \t](?:-R\b|--recursive\b|root\b|0:0)`,
+	),
+	re(
+		String.raw`${CMD_POS}(?:chmod|chown)\b[^\n;|&]*(?:\.env\b|id_rsa|id_ed25519|\.pem\b|credentials|secrets?\b)`,
+	),
+	// Service state changes (sudo prefixes are stripped before matching).
+	re(
+		String.raw`${CMD_POS}(?:systemctl|service)\b[^\n;|&]*\b(?:start|stop|restart|reload|mask|unmask|enable|disable)\b`,
+	),
 ];
 
 // Git. Index-only operations are allowed: `git reset` without
@@ -73,16 +93,20 @@ const GIT = [
 ];
 
 // Process / containers / process managers. `kill -0` is a liveness probe.
+// `kill` is case-sensitive so signal names (KILL) and SQL (KILL QUERY) don't match.
 const RUNTIME = [
-	re(String.raw`\b${EXE}kill\b(?![ \t]+-0\b)`),
-	re(String.raw`\b${EXE}(?:killall|pkill)\b`),
+	re(String.raw`${CMD_POS}kill\b(?![ \t]+-0\b)`, ""),
+	re(String.raw`${CMD_POS}(?:killall|pkill)\b`),
 	re(
 		String.raw`\bdocker(?:-compose|\s+compose)?\s+(?:rm|rmi|down|prune|volume\s+(?:rm|prune)|system\s+prune)\b`,
 	),
 	re(String.raw`\bkubectl\s+(?:delete|drain)\b`),
 	re(String.raw`\bkubectl\s+replace\b[^\n]*--force\b`),
-	re(String.raw`\bpm2\s+(?:delete|stop|restart|reload|kill)\b`),
+	re(String.raw`\bpm2\s+(?:delete|kill)\b`),
 ];
+
+// pm2 stop/restart/reload only prompt over ssh (remote/prod); local dev pm2 is free.
+const PM2_SOFT = re(String.raw`\bpm2\s+(?:stop|restart|reload)\b`);
 
 // Inherently mutating database tooling always asks.
 const DATABASE_ALWAYS = [
@@ -143,9 +167,18 @@ const PATTERNS = [...FILESYSTEM, ...GIT, ...RUNTIME];
 const SSH_PATTERNS = [...FILESYSTEM, ...GIT, ...RUNTIME, ...SSH_DATABASE_WRITE];
 
 // Heredoc bodies are data (file content), not executed commands — unless the
-// receiving command is a shell/ssh that will execute them.
-const HEREDOC_INTERPRETER = /\b(?:ssh|bash|sh|zsh|ksh|dash|eval|source)\b/i;
+// receiver is a shell that will execute them. A data interpreter (python/node)
+// receiving stdin — locally or over ssh — treats the body as data, not shell.
+const HEREDOC_SHELL = /\b(?:bash|sh|zsh|ksh|dash|eval|source)\b/i;
+const HEREDOC_DATA_INTERPRETER =
+	/\b(?:python[\d.]*|node|deno|bun|ruby|perl|php)\b/i;
 const HEREDOC_OPEN = /<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/;
+
+function heredocBodyExecutes(openLine: string): boolean {
+	if (HEREDOC_SHELL.test(openLine)) return true;
+	if (HEREDOC_DATA_INTERPRETER.test(openLine)) return false;
+	return /\bssh\b/i.test(openLine);
+}
 
 function stripHeredocBodies(text: string): string {
 	const lines = text.split("\n");
@@ -156,7 +189,7 @@ function stripHeredocBodies(text: string): string {
 		out.push(line);
 		const open = line.match(HEREDOC_OPEN);
 		i += 1;
-		if (!open || HEREDOC_INTERPRETER.test(line)) continue;
+		if (!open || heredocBodyExecutes(line)) continue;
 		const delimiter = open[2];
 		while (i < lines.length && lines[i].trim() !== delimiter) i += 1;
 		if (i < lines.length) {
@@ -171,7 +204,7 @@ function stripHeredocBodies(text: string): string {
 // variables, not roots), or recursive removal strictly under temp dirs.
 const RM_TOKEN = String.raw`(?:'[^'\n]*'|"[^"\n]*"|[^\s;|&<>()'"]+)`;
 const RM_INVOCATION = re(
-	String.raw`(^|[\n;&|][ \t]*)((?:\/(?:usr\/)?bin\/)?rm(?:[ \t]+${RM_TOKEN})+)`,
+	String.raw`(^|[\n;&|'"][ \t]*)((?:\/(?:usr\/)?bin\/)?(?:rm|rmdir|unlink)(?:[ \t]+${RM_TOKEN})+)`,
 	"gi",
 );
 const RM_SAFE_FLAG = /^(?:-[fv]+|--force)$/;
@@ -191,10 +224,12 @@ function stripSafeRmInvocations(text: string): string {
 		RM_INVOCATION,
 		(match, prefix: string, invocation: string) => {
 			const tokens = invocation
-				.replace(/^(?:\/(?:usr\/)?bin\/)?rm/i, "")
+				.replace(/^(?:\/(?:usr\/)?bin\/)?(?:rm|rmdir|unlink)/i, "")
 				.trim()
 				.split(/[ \t]+/)
 				.filter(Boolean);
+			if (tokens.some((t) => t === "--help" || t === "--version"))
+				return `${prefix}true`;
 			let recursive = false;
 			const targets: string[] = [];
 			for (const raw of tokens) {
@@ -221,8 +256,57 @@ function stripSafeRmInvocations(text: string): string {
 	);
 }
 
+// Data-only commands: their arguments are text/needles, never executed. Skipped
+// entirely when the pipeline could feed that text into an executor or DB client.
+const DATA_ARG_COMMANDS = re(
+	String.raw`(^|[\n;&|'"][ \t]*|&&[ \t]*|\|\|[ \t]*)(?:\/usr\/bin\/)?(?:echo|printf|grep|egrep|fgrep|rg|ag|ack|man|whatis|apropos|type|which|sed|awk|jq|git[ \t]+(?:commit|log|grep|show|diff|blame))\b[^\n;|&]*`,
+	"gi",
+);
+const PIPE_TO_EXECUTOR =
+	/\|[ \t]*(?:sudo[ \t]+)?(?:bash|sh|zsh|ksh|dash|eval|xargs|ssh)\b/i;
+
+function stripDataCommandArgs(text: string): string {
+	if (
+		PIPE_TO_EXECUTOR.test(text) ||
+		SQL_CLIENT.test(text) ||
+		REDIS_CLIENT.test(text) ||
+		MONGO_CLIENT.test(text)
+	)
+		return text;
+	return text.replace(DATA_ARG_COMMANDS, "$1true");
+}
+
+// Inline interpreter scripts (node -e / python -c) are data unless they reach
+// for process/filesystem mutation APIs.
+const INLINE_SCRIPT = re(
+	String.raw`\b(?:node|deno|bun|python[\d.]*|ruby|perl)\b[^\n;|&]*?[ \t](?:-e|-c|--eval)[ \t]+('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")`,
+	"gi",
+);
+const SCRIPT_EXEC_API =
+	/child_process|execSync|spawn|\bexec\s*\(|os\.system|os\.remove|os\.unlink|os\.rmdir|shutil|subprocess|popen|fs\.(?:rm|unlink|rmdir)|rimraf|system\s*\(/i;
+
+function stripInlineScripts(text: string): string {
+	return text.replace(INLINE_SCRIPT, (match, literal: string) =>
+		SCRIPT_EXEC_API.test(literal) ? match : match.replace(literal, "''"),
+	);
+}
+
+// sudo itself is not destructive; strip the prefix and match what it wraps.
+// `sudo rm -rf /` still flags via rm; `sudo head file` passes.
+const SUDO_PREFIX = re(
+	String.raw`(^|[\n;&|'"\`(]|&&|\|\|)([ \t]*)(?:\/(?:usr\/)?(?:local\/)?bin\/)?sudo\b(?:[ \t]+(?:-u[ \t]+\S+|-g[ \t]+\S+|--[\w-]+(?:=\S*)?|-[A-Za-z]+))*[ \t]+(?=\S)`,
+	"gi",
+);
+
+function stripSudoPrefix(text: string): string {
+	return text.replace(SUDO_PREFIX, "$1$2");
+}
+
 function sanitizeCommand(text: string): string {
 	let result = stripHeredocBodies(text);
+	result = stripDataCommandArgs(result);
+	result = stripInlineScripts(result);
+	result = stripSudoPrefix(result);
 	result = result.replace(SAFE_CD_TMP_RM, "cd /tmp && true");
 	return stripSafeRmInvocations(result);
 }
@@ -235,7 +319,13 @@ export function isDestructiveCommand(command: string): boolean {
 	if (SAFE_WORKTREE_RM.test(original)) return false;
 	const text = sanitizeCommand(original);
 	if (isDatabaseDestructive(text)) return true;
-	const patterns = /^ssh\b/i.test(original) ? SSH_PATTERNS : PATTERNS;
+	// Inline scripts that survived stripping reference mutation APIs.
+	for (const m of text.matchAll(INLINE_SCRIPT)) {
+		if (SCRIPT_EXEC_API.test(m[1])) return true;
+	}
+	const isSsh = /^ssh\b/i.test(original);
+	if (isSsh && PM2_SOFT.test(text)) return true;
+	const patterns = isSsh ? SSH_PATTERNS : PATTERNS;
 	return patterns.some((pattern) => pattern.test(text));
 }
 
@@ -264,26 +354,24 @@ function saveAllowPattern(pattern: string, path = ALLOWLIST_PATH): void {
 	);
 }
 
-/** Glob match where `*` matches any text including newlines. */
+/** Glob match where `*` matches any text including newlines. SSH approvals must be exact. */
 export function matchesAllowPattern(command: string, pattern: string): boolean {
-	const escaped = pattern
-		.trim()
+	const normalizedPattern = pattern.trim();
+	if (
+		/^(?:\/usr\/bin\/)?ssh\b/u.test(normalizedPattern) &&
+		normalizedPattern.includes("*")
+	) {
+		return false;
+	}
+	const escaped = normalizedPattern
 		.replace(/[.+^${}()|[\]\\?]/g, "\\$&")
 		.replace(/\*/g, "[\\s\\S]*");
 	return new RegExp(`^${escaped}$`).test(command.trim());
 }
 
-/**
- * Suggested "always allow" pattern for a command. For SSH commands this is
- * scoped to the destination (`ssh <alias> *`); otherwise the exact command.
- */
+/** Suggested persistent approval. SSH commands are always exact-command scoped. */
 export function suggestAllowPattern(command: string): string {
-	const text = command.trim();
-	const ssh = text.match(
-		/^((?:\/usr\/bin\/)?ssh)\s+((?:-\S+\s+)*)([A-Za-z0-9_.@-]+)\b/,
-	);
-	if (ssh) return `${ssh[1]} ${ssh[2]}${ssh[3]} *`;
-	return text;
+	return command.trim();
 }
 
 /** One-line trimmed snippet for prompt labels/previews. */
@@ -377,7 +465,9 @@ async function generateHint(
 				)
 				.result();
 			const text = response.content
-				.filter((c: any): c is { type: "text"; text: string } => c.type === "text")
+				.filter(
+					(c: any): c is { type: "text"; text: string } => c.type === "text",
+				)
 				.map((c: { text: string }) => c.text)
 				.join("\n")
 				.trim();
@@ -406,8 +496,29 @@ function extractCommand(toolName: string, input: unknown): string | undefined {
 	return typeof value === "string" ? value : undefined;
 }
 
-export default function (pi: ExtensionAPI) {
+type StatusContext = {
+	ui: { setStatus?(key: string, text: string): void };
+};
+
+function setGuardStatus(ctx: StatusContext, text: string): void {
+	try {
+		ctx.ui.setStatus?.("destructive-command-guard", text);
+	} catch {}
+}
+
+function readyStatus(allowlistPath: string): string {
+	const count = loadAllowPatterns(allowlistPath).length;
+	return count === 0
+		? "Ready"
+		: `Ready · ${count} saved ${count === 1 ? "rule" : "rules"}`;
+}
+
+export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 	const sessionAllow: string[] = [];
+
+	pi.on("session_start", (_event, ctx) => {
+		setGuardStatus(ctx, readyStatus(allowlistPath));
+	});
 
 	pi.on("tool_call", async (event, ctx) => {
 		const command = extractCommand(event.toolName, event.input);
@@ -415,7 +526,10 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		}
 
-		const allowPatterns = [...loadAllowPatterns(), ...sessionAllow];
+		const allowPatterns = [
+			...loadAllowPatterns(allowlistPath),
+			...sessionAllow,
+		];
 		if (
 			allowPatterns.some((pattern) => matchesAllowPattern(command, pattern))
 		) {
@@ -436,37 +550,64 @@ export default function (pi: ExtensionAPI) {
 			command.length > 4000 ? `${command.slice(0, 4000)}…` : command;
 		const truncated = shortPreview !== command.trim();
 
-		pi.events.emit("warp-pi-notify:approval-required", {});
+		try {
+			pi.events.emit("warp-pi-notify:approval-required", {
+				toolName: event.toolName,
+				command: shortPreview,
+			});
+		} catch {
+			return {
+				block: true,
+				reason: "Destructive command approval notification failed",
+			};
+		}
 		const hint = await generateHint(ctx as unknown as HintCtx, command);
 		const hintBlock = hint ? `\nHint: ${hint}\n` : "";
 		let showFull = false;
-		for (;;) {
-			const options = [
-				"Allow once",
-				`Allow for this session: ${suggestedLabel}`,
-				`Always allow: ${suggestedLabel}`,
-				...(truncated && !showFull ? ["Show full command"] : []),
-				"Deny",
-			];
-			const choice = await ctx.ui.select(
-				`Destructive command\nTool: ${event.toolName}\n\n${showFull ? fullPreview : shortPreview}\n${hintBlock}\nAllow this command?`,
-				options,
-			);
+		setGuardStatus(ctx, "Approval pending");
+		try {
+			for (;;) {
+				const options = [
+					"Allow once",
+					`Allow for this session: ${suggestedLabel}`,
+					`Always allow: ${suggestedLabel}`,
+					...(truncated && !showFull ? ["Show full command"] : []),
+					"Deny",
+				];
+				const choice = await ctx.ui.select(
+					`Destructive command\nTool: ${event.toolName}\n\n${showFull ? fullPreview : shortPreview}\n${hintBlock}\nAllow this command?`,
+					options,
+				);
 
-			if (choice === "Show full command") {
-				showFull = true;
-				continue;
+				if (choice === "Show full command") {
+					showFull = true;
+					continue;
+				}
+				if (choice === options[0]) return undefined;
+				if (choice === options[1]) {
+					sessionAllow.push(suggested);
+					return undefined;
+				}
+				if (choice === options[2]) {
+					const confirmed = await ctx.ui.confirm(
+						"Persist destructive-command approval?",
+						`Always allow this pattern?\n\n${suggested}`,
+					);
+					if (!confirmed) {
+						return {
+							block: true,
+							reason: "Destructive command blocked by user",
+						};
+					}
+					saveAllowPattern(suggested, allowlistPath);
+					return undefined;
+				}
+				return { block: true, reason: "Destructive command blocked by user" };
 			}
-			if (choice === options[0]) return undefined;
-			if (choice === options[1]) {
-				sessionAllow.push(suggested);
-				return undefined;
-			}
-			if (choice === options[2]) {
-				saveAllowPattern(suggested);
-				return undefined;
-			}
-			return { block: true, reason: "Destructive command blocked by user" };
+		} catch {
+			return { block: true, reason: "Destructive command approval UI failed" };
+		} finally {
+			setGuardStatus(ctx, readyStatus(allowlistPath));
 		}
 	});
 
@@ -476,10 +617,10 @@ export default function (pi: ExtensionAPI) {
 			_args: unknown,
 			ctx: { ui: { notify(msg: string, type?: string): void } },
 		) => {
-			const saved = loadAllowPatterns();
+			const saved = loadAllowPatterns(allowlistPath);
 			ctx.ui.notify(
 				[
-					`Saved (${ALLOWLIST_PATH}):`,
+					`Saved (${allowlistPath}):`,
 					...(saved.length ? saved.map((p) => `  ${p}`) : ["  (none)"]),
 					"Session:",
 					...(sessionAllow.length

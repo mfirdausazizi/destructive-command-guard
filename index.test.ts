@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import registerGuard, {
 	isDestructiveCommand,
+	loadAllowPatterns,
 	matchesAllowPattern,
 	suggestAllowPattern,
 	trimSnippet,
@@ -59,6 +63,45 @@ const SAFE = [
 	"git branch --delete merged-branch",
 	// Liveness probe
 	"kill -0 1234",
+	// Help/version output only
+	"rm --help",
+	"rm --help >/dev/null",
+	// rmdir/unlink of explicit non-glob targets (same power as allowed `rm file`)
+	"rmdir tmp/rev 2>&1; echo done",
+	"unlink probe.txt",
+	// Destructive tokens in data/search position are not commands
+	"grep -rn 'rm -rf' src | head -5",
+	'rg -n "rm |force|drop " index.ts',
+	"echo 'do not rm -rf /'",
+	"printf 'chmod 777 secrets'",
+	"man sudo",
+	"which rm",
+	"git log --grep='git reset --hard'",
+	"git commit -m 'remove kill switch and rm helper'",
+	"FOO=rm ls",
+	"grep -n 'trap .*EXIT\\|KILL' monitor.sh",
+	"for s in TERM KILL; do echo $s; done",
+	"node -e 'console.log(\"rm -rf build\")'",
+	"python3 -c 'print(\"chmod 777\")'",
+	// sudo wrapping a read-only command
+	"sudo head -n 100 /var/log/app.log",
+	"ssh wabot-v3-sql 'sudo head -n 100 /var/lib/rehearsal/logs/restore-result.json'",
+	"ssh wabot-v3-new 'sudo ls -l /etc/nginx/sites-enabled'",
+	// chmod/chown routine forms on own files
+	"chmod +x /tmp/lc-probe.sh",
+	"chmod 644 file.txt",
+	"chmod u+w build/out.js",
+	// Local pm2 process control (only ssh pm2 soft verbs prompt)
+	"pm2 restart api",
+	"pm2 stop api",
+	"pm2 reload api",
+	"pm2 status",
+	// ssh-quoted temp cleanup
+	"ssh wabot-v3-new 'rm -f /tmp/verify.js'",
+	// Heredoc into a data interpreter over ssh is data, not shell
+	"ssh host 'python3 -' <<'PY'\nprint('rm -rf /')\nPY",
+	// Identifier collisions
+	"node -e 'console.log(1)' # truncateToWidth mention",
 	// Words containing pattern names must not match
 	"pi --no-kill-switch describe",
 ];
@@ -74,9 +117,20 @@ const DESTRUCTIVE = [
 	"docker-compose down -v",
 	"docker compose down -v",
 	"kubectl delete deployment api",
-	"pm2 restart api",
 	"chmod 777 secrets.env",
 	"chown root:root file",
+	"chmod o+w /srv/app",
+	"chown -R deploy:deploy /srv/app",
+	"sudo rm -rf /var/lib/app",
+	"sudo systemctl stop nginx",
+	"pm2 delete api",
+	"pm2 kill",
+	"ssh wabot-v3-new 'pm2 restart api'",
+	"ssh wabot-v3-new 'pm2 stop api'",
+	"ssh host 'rm -rf /var/www/html'",
+	"truncate -s 0 notes.md",
+	"python3 -c \"import os; os.unlink('/Users/firdausazizi/real.md')\"",
+	"echo 'DROP TABLE users' | mysql db",
 	"kill -9 1234",
 	"docker system prune -af",
 	"ssh wabot-v3-new \"mysql -e 'DROP TABLE users'\"",
@@ -202,35 +256,35 @@ test("allow pattern matching and suggestions", () => {
 	assert.equal(suggestAllowPattern("rm -rf build"), "rm -rf build");
 	assert.equal(
 		suggestAllowPattern("ssh wabot-dev-oc 'pm2 status'"),
-		"ssh wabot-dev-oc *",
+		"ssh wabot-dev-oc 'pm2 status'",
 	);
 	assert.equal(
 		suggestAllowPattern(
 			"ssh wabot-dev-oc 'bash -s' <<'REMOTE'\ngit reset --hard\nREMOTE",
 		),
-		"ssh wabot-dev-oc *",
+		"ssh wabot-dev-oc 'bash -s' <<'REMOTE'\ngit reset --hard\nREMOTE",
 	);
 	assert.equal(
 		suggestAllowPattern("/usr/bin/ssh user@wabot-dev-oc uptime"),
-		"/usr/bin/ssh user@wabot-dev-oc *",
+		"/usr/bin/ssh user@wabot-dev-oc uptime",
 	);
 
 	assert.ok(
-		matchesAllowPattern(
+		!matchesAllowPattern(
 			"ssh wabot-dev-oc 'pm2 restart api'",
 			"ssh wabot-dev-oc *",
 		),
 	);
 	assert.ok(
 		matchesAllowPattern(
-			"ssh wabot-dev-oc 'bash -s' <<'REMOTE'\ngit reset --hard\nREMOTE",
-			"ssh wabot-dev-oc *",
+			"ssh wabot-dev-oc 'pm2 restart api'",
+			"ssh wabot-dev-oc 'pm2 restart api'",
 		),
 	);
 	assert.ok(
 		!matchesAllowPattern(
-			"ssh other-host 'pm2 restart api'",
-			"ssh wabot-dev-oc *",
+			"ssh wabot-dev-oc 'pm2 restart worker'",
+			"ssh wabot-dev-oc 'pm2 restart api'",
 		),
 	);
 	assert.ok(matchesAllowPattern("rm -rf build", "rm -rf build"));
@@ -240,15 +294,16 @@ test("allow pattern matching and suggestions", () => {
 test("tool handler prompts, emits approval events, blocks rejection, and fails closed headlessly", async () => {
 	let handler: ((event: any, ctx: any) => Promise<any>) | undefined;
 	const emitted: string[] = [];
+	const payloads: unknown[] = [];
 	registerGuard({
 		on(event: string, callback: typeof handler) {
-			assert.equal(event, "tool_call");
-			handler = callback;
+			if (event === "tool_call") handler = callback;
 		},
 		registerCommand() {},
 		events: {
-			emit(event: string) {
+			emit(event: string, payload?: unknown) {
 				emitted.push(event);
+				payloads.push(payload);
 			},
 		},
 	} as any);
@@ -284,7 +339,7 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 
 	assert.deepEqual(
 		await handler(
-			{ toolName: "bash", input: { command: "rm --help" } },
+			{ toolName: "bash", input: { command: "git reset --hard" } },
 			{ hasUI: false },
 		),
 		{
@@ -303,6 +358,10 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 	);
 	assert.equal(prompts, 1);
 	assert.deepEqual(emitted, ["warp-pi-notify:approval-required"]);
+	assert.deepEqual(payloads[0], {
+		toolName: "ctx_shell",
+		command: "psql -f migrate.sql",
+	});
 
 	answer = "Allow once";
 	assert.equal(
@@ -325,20 +384,28 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 	);
 	assert.equal(prompts, 3);
 
-	// Session allow persists for the session (ssh commands scope to host)
+	// Session SSH approvals persist only for the exact command.
 	answer = "Allow for this session";
+	const sessionSsh = "ssh test-guard-host 'pm2 restart api'";
 	assert.equal(
 		await handler(
-			{
-				toolName: "bash",
-				input: { command: "ssh test-guard-host 'pm2 restart api'" },
-			},
+			{ toolName: "bash", input: { command: sessionSsh } },
 			{ hasUI: true, ui },
 		),
 		undefined,
 	);
 	assert.equal(prompts, 4);
 	assert.equal(
+		await handler(
+			{ toolName: "bash", input: { command: sessionSsh } },
+			{ hasUI: true, ui },
+		),
+		undefined,
+	);
+	assert.equal(prompts, 4);
+
+	answer = "Deny";
+	assert.deepEqual(
 		await handler(
 			{
 				toolName: "bash",
@@ -348,15 +415,15 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 			},
 			{ hasUI: true, ui },
 		),
-		undefined,
+		{ block: true, reason: "Destructive command blocked by user" },
 	);
-	assert.equal(prompts, 4);
+	assert.equal(prompts, 5);
 
-	assert.deepEqual(emitted.length, 4);
+	assert.deepEqual(emitted.length, 5);
 
 	// Long commands show a trimmed snippet with a "Show full command" option;
 	// choosing it re-prompts with the full text and without that option.
-	const longCommand = `rm --help ${"x".repeat(300)}`;
+	const longCommand = `git reset --hard ${"x".repeat(300)}`;
 	const seen: { title: string; options: string[] }[] = [];
 	const expandingUi = {
 		select: async (title: string, options: string[]) => {
@@ -378,6 +445,125 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 	assert.ok(seen[0].title.includes("\u2026"));
 	assert.ok(!seen[1].options.includes("Show full command"));
 	assert.ok(seen[1].title.includes(longCommand));
+});
+
+test("persistent approvals require confirmation and status is restored", async () => {
+	const allowlistPath = join(
+		mkdtempSync(join(tmpdir(), "destructive-guard-")),
+		"allowlist.json",
+	);
+	const handlers = new Map<
+		string,
+		(event: any, ctx: any) => Promise<any> | any
+	>();
+	registerGuard(
+		{
+			on(
+				event: string,
+				callback: (event: any, ctx: any) => Promise<any> | any,
+			) {
+				handlers.set(event, callback);
+			},
+			registerCommand() {},
+			events: { emit() {} },
+		} as any,
+		allowlistPath,
+	);
+
+	const statuses: string[] = [];
+	let confirmed = false;
+	const ctx = {
+		hasUI: true,
+		ui: {
+			select: async (_title: string, options: string[]) =>
+				options.find((option) => option.startsWith("Always allow")),
+			confirm: async () => confirmed,
+			setStatus: (_key: string, text: string) => statuses.push(text),
+		},
+	};
+
+	await handlers.get("session_start")?.({}, ctx);
+	assert.match(statuses.at(-1) ?? "", /^Ready/);
+
+	const event = { toolName: "bash", input: { command: "rm -rf build" } };
+	assert.deepEqual(await handlers.get("tool_call")?.(event, ctx), {
+		block: true,
+		reason: "Destructive command blocked by user",
+	});
+	assert.equal(existsSync(allowlistPath), false);
+	assert.deepEqual(statuses.slice(-2), ["Approval pending", "Ready"]);
+
+	confirmed = true;
+	assert.equal(await handlers.get("tool_call")?.(event, ctx), undefined);
+	assert.deepEqual(loadAllowPatterns(allowlistPath), ["rm -rf build"]);
+	assert.deepEqual(statuses.slice(-2), [
+		"Approval pending",
+		"Ready · 1 saved rule",
+	]);
+});
+
+test("approval notification failures block instead of escaping the guard", async () => {
+	let handler: ((event: any, ctx: any) => Promise<any>) | undefined;
+	registerGuard({
+		on(event: string, callback: typeof handler) {
+			if (event === "tool_call") handler = callback;
+		},
+		registerCommand() {},
+		events: {
+			emit() {
+				throw new Error("listener failed");
+			},
+		},
+	} as any);
+	assert.ok(handler);
+
+	assert.deepEqual(
+		await handler(
+			{ toolName: "bash", input: { command: "rm -rf notification-test" } },
+			{ hasUI: true, ui: {} },
+		),
+		{ block: true, reason: "Destructive command approval notification failed" },
+	);
+});
+
+test("cancelled and failed dialogs restore Ready status and block", async () => {
+	let handler: ((event: any, ctx: any) => Promise<any>) | undefined;
+	const allowlistPath = join(
+		mkdtempSync(join(tmpdir(), "destructive-guard-")),
+		"allowlist.json",
+	);
+	registerGuard(
+		{
+			on(event: string, callback: typeof handler) {
+				if (event === "tool_call") handler = callback;
+			},
+			registerCommand() {},
+			events: { emit() {} },
+		} as any,
+		allowlistPath,
+	);
+	assert.ok(handler);
+
+	for (const select of [
+		async () => undefined,
+		async () => {
+			throw new Error("dialog failed");
+		},
+	]) {
+		const statuses: string[] = [];
+		const result = await handler(
+			{ toolName: "bash", input: { command: "rm -rf dialog-test" } },
+			{
+				hasUI: true,
+				ui: {
+					select,
+					setStatus: (_key: string, text: string) => statuses.push(text),
+				},
+			},
+		);
+		assert.equal(result?.block, true);
+		assert.deepEqual(statuses, ["Approval pending", "Ready"]);
+	}
 });
 
 test("trimSnippet collapses whitespace and bounds length", () => {
