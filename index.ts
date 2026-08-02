@@ -163,7 +163,6 @@ const SSH_DATABASE_WRITE = [
 	),
 ];
 
-const PATTERNS = [...FILESYSTEM, ...GIT, ...RUNTIME];
 const SSH_PATTERNS = [...FILESYSTEM, ...GIT, ...RUNTIME, ...SSH_DATABASE_WRITE];
 
 // Heredoc bodies are data (file content), not executed commands — unless the
@@ -302,34 +301,74 @@ function stripSudoPrefix(text: string): string {
 	return text.replace(SUDO_PREFIX, "$1$2");
 }
 
+const GIT_OPTION_VALUE = String.raw`(?:"[^"\n]*"|'[^'\n]*'|[^\s;|&]+)`;
+const GIT_GLOBAL_PREFIX = new RegExp(
+	String.raw`\bgit(?:(?:\s+-[Cc](?:\s+)?${GIT_OPTION_VALUE})|(?:\s+--(?:git-dir|work-tree|namespace|config-env|attr-source|super-prefix)(?:=${GIT_OPTION_VALUE}|\s+${GIT_OPTION_VALUE}))|(?:\s+(?:-[pP]|--(?:bare|no-replace-objects|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs|no-optional-locks|no-pager|paginate))))+\s+`,
+	"g",
+);
+
 function sanitizeCommand(text: string): string {
 	let result = stripHeredocBodies(text);
 	result = stripDataCommandArgs(result);
 	result = stripInlineScripts(result);
 	result = stripSudoPrefix(result);
+	result = result.replace(GIT_GLOBAL_PREFIX, "git ");
 	result = result.replace(SAFE_CD_TMP_RM, "cd /tmp && true");
 	return stripSafeRmInvocations(result);
 }
 
-/** Pure matcher used by tests and the tool_call handler. */
-export function isDestructiveCommand(command: string): boolean {
+/** Destructive category used for deterministic approval facts. */
+export type DestructiveCategory =
+	| "filesystem"
+	| "Git"
+	| "runtime"
+	| "database"
+	| "remote action";
+
+/** Classify a command once so matching and prompt explanations cannot diverge. */
+export function classifyDestructiveCommand(
+	command: string,
+): DestructiveCategory | undefined {
 	const original = command.trim();
-	if (!original) return false;
-	if (SAFE_CLIPBOARD_RM.test(original)) return false;
-	if (SAFE_WORKTREE_RM.test(original)) return false;
+	if (!original) return undefined;
+	if (SAFE_CLIPBOARD_RM.test(original)) return undefined;
+	if (SAFE_WORKTREE_RM.test(original)) return undefined;
 	const text = sanitizeCommand(original);
-	if (isDatabaseDestructive(text)) return true;
+	const isSsh = /^(?:\/usr\/bin\/)?ssh\b/i.test(original);
+	const database = isDatabaseDestructive(text);
+	let inlineMutation = false;
 	// Inline scripts that survived stripping reference mutation APIs.
-	for (const m of text.matchAll(INLINE_SCRIPT)) {
-		if (SCRIPT_EXEC_API.test(m[1])) return true;
+	for (const match of text.matchAll(INLINE_SCRIPT)) {
+		if (SCRIPT_EXEC_API.test(match[1])) {
+			inlineMutation = true;
+			break;
+		}
 	}
-	const isSsh = /^ssh\b/i.test(original);
-	if (isSsh && PM2_SOFT.test(text)) return true;
-	const patterns = isSsh ? SSH_PATTERNS : PATTERNS;
-	return patterns.some((pattern) => pattern.test(text));
+	if (isSsh) {
+		if (
+			database ||
+			inlineMutation ||
+			PM2_SOFT.test(text) ||
+			SSH_PATTERNS.some((pattern) => pattern.test(text))
+		) {
+			return "remote action";
+		}
+		return undefined;
+	}
+	if (database) return "database";
+	if (inlineMutation) return "filesystem";
+	if (GIT.some((pattern) => pattern.test(text))) return "Git";
+	if (FILESYSTEM.some((pattern) => pattern.test(text))) return "filesystem";
+	if (RUNTIME.some((pattern) => pattern.test(text))) return "runtime";
+	return undefined;
 }
 
-/** Load persisted allow patterns (glob: `*` matches anything, incl. newlines). */
+/** Pure matcher used by tests and the tool_call handler. */
+export function isDestructiveCommand(command: string): boolean {
+	return classifyDestructiveCommand(command) !== undefined;
+}
+
+/** Load persisted exact commands from the compatibility `allow` array. */
 export function loadAllowPatterns(path = ALLOWLIST_PATH): string[] {
 	try {
 		if (!existsSync(path)) return [];
@@ -354,22 +393,12 @@ function saveAllowPattern(pattern: string, path = ALLOWLIST_PATH): void {
 	);
 }
 
-/** Glob match where `*` matches any text including newlines. SSH approvals must be exact. */
+/** Exact normalized command match for session and all-sessions approvals. */
 export function matchesAllowPattern(command: string, pattern: string): boolean {
-	const normalizedPattern = pattern.trim();
-	if (
-		/^(?:\/usr\/bin\/)?ssh\b/u.test(normalizedPattern) &&
-		normalizedPattern.includes("*")
-	) {
-		return false;
-	}
-	const escaped = normalizedPattern
-		.replace(/[.+^${}()|[\]\\?]/g, "\\$&")
-		.replace(/\*/g, "[\\s\\S]*");
-	return new RegExp(`^${escaped}$`).test(command.trim());
+	return command.trim() === pattern.trim();
 }
 
-/** Suggested persistent approval. SSH commands are always exact-command scoped. */
+/** Suggested exact command for session or all-sessions approval. */
 export function suggestAllowPattern(command: string): string {
 	return command.trim();
 }
@@ -380,106 +409,67 @@ export function trimSnippet(text: string, max = 80): string {
 	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
 }
 
-// Hint generation: fast/cheap models explain what the command does and why
-// it is risky. Best-effort — the prompt still shows if this fails.
-const HINT_MODELS: Array<[string, string]> = [
-	["cliproxyapi", "grok-4.5"],
-	["cliproxyapi", "gpt-5.6-luna"],
-];
-const HINT_TIMEOUT_MS = 12_000;
+const SOURCE_TAG = "[destructive-command-guard]";
+const HINT_SERVICE_KEY = Symbol.for("pi-security-hints:service");
 
-// biome-ignore lint/suspicious/noExplicitAny: pi-ai types resolved at runtime
-type HintCtx = {
-	modelRegistry?: {
-		find(provider: string, id: string): any;
-		getProvider(provider: string): any;
-		getApiKeyAndHeaders(model: unknown): Promise<{
-			ok: boolean;
-			apiKey?: string;
-			headers?: Record<string, string>;
-			env?: Record<string, string>;
-		}>;
-	};
+interface SecurityHintService {
+	generate(request: {
+		source: "destructive-command-guard";
+		what: string;
+		why: string;
+		operation?: string;
+	}): Promise<string | undefined>;
+}
+
+interface DestructiveFacts {
+	what: string;
+	why: string;
+}
+
+const CATEGORY_RISK: Record<DestructiveCategory, string> = {
+	filesystem: "This can permanently remove files or alter system state.",
+	Git: "This can discard worktree changes or rewrite repository history.",
+	runtime: "This can stop processes or remove runtime resources.",
+	database: "This can mutate or remove stored data or schema.",
+	"remote action":
+		"This changes a remote system where recovery and local inspection may be limited.",
 };
 
-// Temporary debug log for hint generation failures.
-function hintLog(message: string): void {
-	try {
-		writeFileSync(
-			join(homedir(), ".pi", "agent", "destructive-command-guard-hint.log"),
-			`${new Date().toISOString()} ${message}\n`,
-			{ flag: "a" },
-		);
-	} catch {}
+function destructiveFacts(
+	command: string,
+	category: DestructiveCategory,
+): DestructiveFacts {
+	return {
+		what: `Run \`${trimSnippet(command, 200)}\`.`,
+		why: `Matched destructive ${category} behavior. ${CATEGORY_RISK[category]}`,
+	};
+}
+
+function blockReason(facts: DestructiveFacts, detail: string): string {
+	return `${SOURCE_TAG}\nWhat: ${facts.what}\nWhy: ${facts.why}\n${detail}`;
+}
+
+function getSecurityHintService(): SecurityHintService | undefined {
+	const service = (globalThis as Record<symbol, unknown>)[HINT_SERVICE_KEY];
+	if (!service || typeof service !== "object") return undefined;
+	const generate = (service as { generate?: unknown }).generate;
+	return typeof generate === "function" ? (service as SecurityHintService) : undefined;
 }
 
 async function generateHint(
-	ctx: HintCtx,
+	facts: DestructiveFacts,
 	command: string,
 ): Promise<string | undefined> {
-	if (!ctx.modelRegistry) {
-		hintLog("no modelRegistry on ctx");
+	try {
+		return await getSecurityHintService()?.generate({
+			source: "destructive-command-guard",
+			what: facts.what,
+			why: facts.why,
+			operation: command,
+		});
+	} catch {
 		return undefined;
 	}
-	const prompt = `You are a shell-safety assistant. In at most 2 short sentences, explain what this command does and why it might be dangerous (what could be lost or broken). Plain text only, no markdown.\n\nCommand:\n${command.slice(0, 4000)}`;
-	for (const [provider, id] of HINT_MODELS) {
-		try {
-			const { uuidv7 } = await import("@earendil-works/pi-ai");
-			const model = ctx.modelRegistry.find(provider, id);
-			if (!model) {
-				hintLog(`model not found: ${provider}/${id}`);
-				continue;
-			}
-			const providerImpl = ctx.modelRegistry.getProvider(provider);
-			if (!providerImpl?.streamSimple) {
-				hintLog(`no streamSimple on provider: ${provider}`);
-				continue;
-			}
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok || !auth.apiKey) {
-				hintLog(`auth failed for ${provider}/${id}`);
-				continue;
-			}
-			const response = await providerImpl
-				.streamSimple(
-					model,
-					{
-						messages: [
-							{
-								role: "user" as const,
-								content: [{ type: "text" as const, text: prompt }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{
-						apiKey: auth.apiKey,
-						headers: auth.headers,
-						env: auth.env,
-						maxTokens: 512,
-						reasoning: "low",
-						cacheRetention: "none",
-						sessionId: uuidv7(),
-						signal: AbortSignal.timeout(HINT_TIMEOUT_MS),
-					},
-				)
-				.result();
-			const text = response.content
-				.filter(
-					(c: any): c is { type: "text"; text: string } => c.type === "text",
-				)
-				.map((c: { text: string }) => c.text)
-				.join("\n")
-				.trim();
-			if (text) return text;
-			hintLog(`empty hint from ${provider}/${id}`);
-		} catch (error) {
-			hintLog(
-				`${provider}/${id}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
-			);
-		}
-	}
-	return undefined;
 }
 
 function extractCommand(toolName: string, input: unknown): string | undefined {
@@ -503,7 +493,9 @@ type StatusContext = {
 function setGuardStatus(ctx: StatusContext, text: string): void {
 	try {
 		ctx.ui.setStatus?.("destructive-command-guard", text);
-	} catch {}
+	} catch {
+		// Status is cosmetic; authorization must not depend on host UI support.
+	}
 }
 
 function readyStatus(allowlistPath: string): string {
@@ -522,9 +514,10 @@ export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		const command = extractCommand(event.toolName, event.input);
-		if (!command || !isDestructiveCommand(command)) {
-			return undefined;
-		}
+		const category = command
+			? classifyDestructiveCommand(command)
+			: undefined;
+		if (!command || !category) return undefined;
 
 		const allowPatterns = [
 			...loadAllowPatterns(allowlistPath),
@@ -536,10 +529,11 @@ export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 			return undefined;
 		}
 
+		const facts = destructiveFacts(command, category);
 		if (!ctx.hasUI) {
 			return {
 				block: true,
-				reason: "Destructive command requires interactive approval",
+				reason: blockReason(facts, "Interactive approval is required."),
 			};
 		}
 
@@ -558,24 +552,24 @@ export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 		} catch {
 			return {
 				block: true,
-				reason: "Destructive command approval notification failed",
+				reason: blockReason(facts, "Approval notification failed."),
 			};
 		}
-		const hint = await generateHint(ctx as unknown as HintCtx, command);
-		const hintBlock = hint ? `\nHint: ${hint}\n` : "";
+		const hint = await generateHint(facts, command);
+		const hintLine = hint ? `\nHint: ${hint}` : "";
 		let showFull = false;
 		setGuardStatus(ctx, "Approval pending");
 		try {
 			for (;;) {
 				const options = [
 					"Allow once",
-					`Allow for this session: ${suggestedLabel}`,
-					`Always allow: ${suggestedLabel}`,
+					`Remember exact command for this session: ${suggestedLabel}`,
+					`Always allow exact command in all sessions: ${suggestedLabel}`,
 					...(truncated && !showFull ? ["Show full command"] : []),
 					"Deny",
 				];
 				const choice = await ctx.ui.select(
-					`Destructive command\nTool: ${event.toolName}\n\n${showFull ? fullPreview : shortPreview}\n${hintBlock}\nAllow this command?`,
+					`${SOURCE_TAG}\nWhat: ${facts.what}\nWhy: ${facts.why}${hintLine}\n\nApproval effects:\n- This session: remember the exact command in memory only.\n- All sessions: write the exact command to ${allowlistPath}.\n\nTool: ${event.toolName}\nCommand:\n${showFull ? fullPreview : shortPreview}\n\nAllow this command?`,
 					options,
 				);
 
@@ -590,22 +584,28 @@ export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 				}
 				if (choice === options[2]) {
 					const confirmed = await ctx.ui.confirm(
-						"Persist destructive-command approval?",
-						`Always allow this pattern?\n\n${suggested}`,
+						`${SOURCE_TAG} Persist exact command for all sessions?`,
+						`What: ${facts.what}\nWhy: ${facts.why}\n\nWrite this exact command to ${allowlistPath}?\n\n${suggested}`,
 					);
 					if (!confirmed) {
 						return {
 							block: true,
-							reason: "Destructive command blocked by user",
+							reason: blockReason(facts, "The user denied this command."),
 						};
 					}
 					saveAllowPattern(suggested, allowlistPath);
 					return undefined;
 				}
-				return { block: true, reason: "Destructive command blocked by user" };
+				return {
+					block: true,
+					reason: blockReason(facts, "The user denied this command."),
+				};
 			}
 		} catch {
-			return { block: true, reason: "Destructive command approval UI failed" };
+			return {
+				block: true,
+				reason: blockReason(facts, "Approval UI failed."),
+			};
 		} finally {
 			setGuardStatus(ctx, readyStatus(allowlistPath));
 		}
@@ -620,9 +620,9 @@ export default function (pi: ExtensionAPI, allowlistPath = ALLOWLIST_PATH) {
 			const saved = loadAllowPatterns(allowlistPath);
 			ctx.ui.notify(
 				[
-					`Saved (${allowlistPath}):`,
+					`All sessions (revoke in ${allowlistPath}):`,
 					...(saved.length ? saved.map((p) => `  ${p}`) : ["  (none)"]),
-					"Session:",
+					"This session (memory only):",
 					...(sessionAllow.length
 						? sessionAllow.map((p) => `  ${p}`)
 						: ["  (none)"]),

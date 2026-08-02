@@ -54,21 +54,20 @@ prompt-free.
 
 ## Approval flow
 
-Prompts show a one-line trimmed snippet (with **Show full command** for
-long commands) and offer:
+Every prompt starts with `[destructive-command-guard]` and deterministic `What`, `Why`, and approval-scope facts.
+The optional `pi-security-hints` service adds at most two short AI risk sentences; missing models, timeouts, or service failures never hide or change the approval decision.
+Long commands use a trimmed preview with **Show full command** before approval.
 
-1. **Allow once**
-2. **Allow for this session** — persists in memory for the Pi session
-3. **Always allow** — requires a second confirmation, then saves to
-   `~/.pi/agent/destructive-command-guard.json`. Local patterns may use globs;
-   SSH approvals are exact-command only, and legacy SSH wildcard rules are ignored.
-4. **Deny** — blocks the tool call
+1. **Allow once** — permits this invocation only.
+2. **Remember exact command for this session** — stores the exact normalized command in memory until the Pi session ends.
+3. **Always allow exact command in all sessions** — requires confirmation, then writes the exact command to `~/.pi/agent/destructive-command-guard.json`.
+4. **Deny** — blocks the tool call.
 
-In headless (no-UI) sessions the guard fails closed and blocks.
+All approvals are exact-command scoped, including SSH commands, and wildcard characters in existing entries are treated literally rather than as broader patterns.
+In headless sessions the guard fails closed with a tagged What/Why denial.
 The extension publishes a session-scoped `destructive-command-guard` status (`Ready` or `Approval pending`) for compatible hosts such as PI WEB.
 
-Use the `/destructive-allowlist` command to inspect saved and session
-allow patterns.
+Use `/destructive-allowlist` to inspect the in-memory session rules and the all-sessions file used for revocation.
 
 ## Install
 

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import registerGuard, {
+	classifyDestructiveCommand,
 	isDestructiveCommand,
 	loadAllowPatterns,
 	matchesAllowPattern,
@@ -13,6 +14,7 @@ import registerGuard, {
 
 const WORKTREE =
 	"/Users/firdausazizi/GithubProjects/wabot-v4-master/wabot-v4/.worktrees/wab-308";
+const HINT_SERVICE_KEY = Symbol.for("pi-security-hints:service");
 
 const SAFE = [
 	"git status",
@@ -61,6 +63,12 @@ const SAFE = [
 	"git restore --staged file.txt",
 	"git branch -d merged-branch",
 	"git branch --delete merged-branch",
+	"git -C/tmp/repo status",
+	"git -ccore.hooksPath=/tmp status",
+	"git --work-tree=/tmp/repo status",
+	"git --no-pager log --oneline",
+	"git -p log --oneline",
+	"git -P status",
 	// Liveness probe
 	"kill -0 1234",
 	// Help/version output only
@@ -110,6 +118,16 @@ const DESTRUCTIVE = [
 	"rm -rf build",
 	"sudo systemctl restart app",
 	"git reset --hard HEAD~1",
+	"git -C /tmp/repo reset --hard HEAD",
+	"git -c core.hooksPath=/tmp reset --hard HEAD",
+	"git -C /tmp/repo -c core.hooksPath=/tmp reset --hard HEAD",
+	"git -C/tmp/repo reset --hard HEAD",
+	"git -ccore.hooksPath=/tmp reset --hard HEAD",
+	"git --work-tree=/tmp/repo reset --hard HEAD",
+	"git --git-dir=/tmp/repo/.git --work-tree=/tmp/repo reset --hard HEAD",
+	"git --no-pager reset --hard HEAD",
+	"git -p reset --hard HEAD",
+	"git -c core.hooksPath=/tmp -P reset --hard HEAD",
 	"git clean -fd",
 	"git push --force-with-lease origin main",
 	"git push -f origin main",
@@ -240,6 +258,11 @@ test("destructive shell commands are flagged", () => {
 	}
 });
 
+test("SSH inline mutation scripts remain destructive remote actions", () => {
+	const command = `ssh host 'python3 -c "import os; os.remove(\"/tmp/x\")"'`;
+	assert.equal(classifyDestructiveCommand(command), "remote action");
+});
+
 test("read-only database client use is allowed", () => {
 	for (const command of DATABASE_READ) {
 		assert.equal(isDestructiveCommand(command), false, command);
@@ -252,7 +275,7 @@ test("database writes and opaque script input are flagged", () => {
 	}
 });
 
-test("allow pattern matching and suggestions", () => {
+test("exact approval matching and suggestions", () => {
 	assert.equal(suggestAllowPattern("rm -rf build"), "rm -rf build");
 	assert.equal(
 		suggestAllowPattern("ssh wabot-dev-oc 'pm2 status'"),
@@ -289,6 +312,7 @@ test("allow pattern matching and suggestions", () => {
 	);
 	assert.ok(matchesAllowPattern("rm -rf build", "rm -rf build"));
 	assert.ok(!matchesAllowPattern("rm -rf build2", "rm -rf build"));
+	assert.ok(!matchesAllowPattern("rm -rf build-cache", "rm -rf build*"));
 });
 
 test("tool handler prompts, emits approval events, blocks rejection, and fails closed headlessly", async () => {
@@ -311,9 +335,11 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 
 	let prompts = 0;
 	let answer = "Deny";
+	const titles: string[] = [];
 	const ui = {
-		select: async (_title: string, options: string[]) => {
+		select: async (title: string, options: string[]) => {
 			prompts += 1;
+			titles.push(title);
 			return options.find((option) => option.startsWith(answer));
 		},
 	};
@@ -344,7 +370,8 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 		),
 		{
 			block: true,
-			reason: "Destructive command requires interactive approval",
+			reason:
+				"[destructive-command-guard]\nWhat: Run `git reset --hard`.\nWhy: Matched destructive Git behavior. This can discard worktree changes or rewrite repository history.\nInteractive approval is required.",
 		},
 	);
 	assert.deepEqual(emitted, []);
@@ -354,7 +381,11 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 			{ toolName: "ctx_shell", input: { command: "psql -f migrate.sql" } },
 			{ hasUI: true, ui },
 		),
-		{ block: true, reason: "Destructive command blocked by user" },
+		{
+			block: true,
+			reason:
+				"[destructive-command-guard]\nWhat: Run `psql -f migrate.sql`.\nWhy: Matched destructive database behavior. This can mutate or remove stored data or schema.\nThe user denied this command.",
+		},
 	);
 	assert.equal(prompts, 1);
 	assert.deepEqual(emitted, ["warp-pi-notify:approval-required"]);
@@ -362,6 +393,11 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 		toolName: "ctx_shell",
 		command: "psql -f migrate.sql",
 	});
+	assert.match(titles[0] ?? "", /^\[destructive-command-guard\]/);
+	assert.match(titles[0] ?? "", /What: Run `psql -f migrate\.sql`\./);
+	assert.match(titles[0] ?? "", /Why: Matched destructive database behavior\./);
+	assert.match(titles[0] ?? "", /Approval effects:/);
+	assert.doesNotMatch(titles[0] ?? "", /Hint:/);
 
 	answer = "Allow once";
 	assert.equal(
@@ -375,17 +411,16 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 
 	// Allow once does not persist: same command prompts again
 	answer = "Deny";
-	assert.deepEqual(
-		await handler(
-			{ toolName: "shell", input: { command: "redis-cli DEL key" } },
-			{ hasUI: true, ui },
-		),
-		{ block: true, reason: "Destructive command blocked by user" },
+	const deniedRedis = await handler(
+		{ toolName: "shell", input: { command: "redis-cli DEL key" } },
+		{ hasUI: true, ui },
 	);
+	assert.equal(deniedRedis?.block, true);
+	assert.match(deniedRedis?.reason ?? "", /^\[destructive-command-guard\]/);
 	assert.equal(prompts, 3);
 
 	// Session SSH approvals persist only for the exact command.
-	answer = "Allow for this session";
+	answer = "Remember exact command for this session";
 	const sessionSsh = "ssh test-guard-host 'pm2 restart api'";
 	assert.equal(
 		await handler(
@@ -405,18 +440,17 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 	assert.equal(prompts, 4);
 
 	answer = "Deny";
-	assert.deepEqual(
-		await handler(
-			{
-				toolName: "bash",
-				input: {
-					command: "ssh test-guard-host 'git reset --hard origin/main'",
-				},
+	const deniedAdjacentSsh = await handler(
+		{
+			toolName: "bash",
+			input: {
+				command: "ssh test-guard-host 'git reset --hard origin/main'",
 			},
-			{ hasUI: true, ui },
-		),
-		{ block: true, reason: "Destructive command blocked by user" },
+		},
+		{ hasUI: true, ui },
 	);
+	assert.equal(deniedAdjacentSsh?.block, true);
+	assert.match(deniedAdjacentSsh?.reason ?? "", /remote action behavior/);
 	assert.equal(prompts, 5);
 
 	assert.deepEqual(emitted.length, 5);
@@ -433,12 +467,14 @@ test("tool handler prompts, emits approval events, blocks rejection, and fails c
 				: options.find((option) => option === "Deny");
 		},
 	};
-	assert.deepEqual(
-		await handler(
-			{ toolName: "bash", input: { command: longCommand } },
-			{ hasUI: true, ui: expandingUi },
-		),
-		{ block: true, reason: "Destructive command blocked by user" },
+	const deniedLongCommand = await handler(
+		{ toolName: "bash", input: { command: longCommand } },
+		{ hasUI: true, ui: expandingUi },
+	);
+	assert.equal(deniedLongCommand?.block, true);
+	assert.match(
+		deniedLongCommand?.reason ?? "",
+		/^\[destructive-command-guard\]/,
 	);
 	assert.equal(seen.length, 2);
 	assert.ok(seen[0].options.includes("Show full command"));
@@ -471,13 +507,19 @@ test("persistent approvals require confirmation and status is restored", async (
 	);
 
 	const statuses: string[] = [];
+	const confirmations: Array<{ title: string; message: string }> = [];
 	let confirmed = false;
 	const ctx = {
 		hasUI: true,
 		ui: {
 			select: async (_title: string, options: string[]) =>
-				options.find((option) => option.startsWith("Always allow")),
-			confirm: async () => confirmed,
+				options.find((option) =>
+					option.startsWith("Always allow exact command in all sessions"),
+				),
+			confirm: async (title: string, message: string) => {
+				confirmations.push({ title, message });
+				return confirmed;
+			},
 			setStatus: (_key: string, text: string) => statuses.push(text),
 		},
 	};
@@ -488,10 +530,14 @@ test("persistent approvals require confirmation and status is restored", async (
 	const event = { toolName: "bash", input: { command: "rm -rf build" } };
 	assert.deepEqual(await handlers.get("tool_call")?.(event, ctx), {
 		block: true,
-		reason: "Destructive command blocked by user",
+		reason:
+			"[destructive-command-guard]\nWhat: Run `rm -rf build`.\nWhy: Matched destructive filesystem behavior. This can permanently remove files or alter system state.\nThe user denied this command.",
 	});
 	assert.equal(existsSync(allowlistPath), false);
 	assert.deepEqual(statuses.slice(-2), ["Approval pending", "Ready"]);
+	assert.match(confirmations[0]?.title ?? "", /^\[destructive-command-guard\]/);
+	assert.match(confirmations[0]?.message ?? "", /rm -rf build/);
+	assert.match(confirmations[0]?.message ?? "", new RegExp(allowlistPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
 	confirmed = true;
 	assert.equal(await handlers.get("tool_call")?.(event, ctx), undefined);
@@ -500,6 +546,57 @@ test("persistent approvals require confirmation and status is restored", async (
 		"Approval pending",
 		"Ready · 1 saved rule",
 	]);
+	confirmed = false;
+	const adjacent = {
+		toolName: "bash",
+		input: { command: "rm -rf build-cache" },
+	};
+	assert.equal((await handlers.get("tool_call")?.(adjacent, ctx))?.block, true);
+	assert.deepEqual(loadAllowPatterns(allowlistPath), ["rm -rf build"]);
+});
+
+test("session approval stays in memory and remains exact-command scoped", async () => {
+	const allowlistPath = join(
+		mkdtempSync(join(tmpdir(), "destructive-guard-session-")),
+		"allowlist.json",
+	);
+	let handler: ((event: any, ctx: any) => Promise<any>) | undefined;
+	registerGuard(
+		{
+			on(event: string, callback: typeof handler) {
+				if (event === "tool_call") handler = callback;
+			},
+			registerCommand() {},
+			events: { emit() {} },
+		} as any,
+		allowlistPath,
+	);
+	assert.ok(handler);
+	let prompts = 0;
+	let answer = "Remember exact command for this session";
+	const ctx = {
+		hasUI: true,
+		ui: {
+			select: async (_title: string, options: string[]) => {
+				prompts += 1;
+				return options.find((option) => option.startsWith(answer));
+			},
+		},
+	};
+	const command = { toolName: "bash", input: { command: "git clean -fd" } };
+	assert.equal(await handler(command, ctx), undefined);
+	assert.equal(await handler(command, ctx), undefined);
+	assert.equal(prompts, 1);
+	assert.equal(existsSync(allowlistPath), false);
+
+	answer = "Deny";
+	const adjacent = {
+		toolName: "bash",
+		input: { command: "git clean -fdx" },
+	};
+	assert.equal((await handler(adjacent, ctx))?.block, true);
+	assert.equal(prompts, 2);
+	assert.equal(existsSync(allowlistPath), false);
 });
 
 test("approval notification failures block instead of escaping the guard", async () => {
@@ -522,7 +619,11 @@ test("approval notification failures block instead of escaping the guard", async
 			{ toolName: "bash", input: { command: "rm -rf notification-test" } },
 			{ hasUI: true, ui: {} },
 		),
-		{ block: true, reason: "Destructive command approval notification failed" },
+		{
+			block: true,
+			reason:
+				"[destructive-command-guard]\nWhat: Run `rm -rf notification-test`.\nWhy: Matched destructive filesystem behavior. This can permanently remove files or alter system state.\nApproval notification failed.",
+		},
 	);
 });
 
@@ -562,7 +663,47 @@ test("cancelled and failed dialogs restore Ready status and block", async () => 
 			},
 		);
 		assert.equal(result?.block, true);
+		assert.match(result?.reason ?? "", /^\[destructive-command-guard\]/);
 		assert.deepEqual(statuses, ["Approval pending", "Ready"]);
+	}
+});
+
+test("shared hint service adds an optional AI hint", async () => {
+	let handler: ((event: any, ctx: any) => Promise<any>) | undefined;
+	const previous = (globalThis as Record<symbol, unknown>)[HINT_SERVICE_KEY];
+	(globalThis as Record<symbol, unknown>)[HINT_SERVICE_KEY] = {
+		generate: async () => "This may discard changes that have not been backed up.",
+	};
+	try {
+		registerGuard({
+			on(event: string, callback: typeof handler) {
+				if (event === "tool_call") handler = callback;
+			},
+			registerCommand() {},
+			events: { emit() {} },
+		} as any);
+		assert.ok(handler);
+		let title = "";
+		const result = await handler(
+			{ toolName: "bash", input: { command: "git reset --hard HEAD~1" } },
+			{
+				hasUI: true,
+				ui: {
+					select: async (value: string) => {
+						title = value;
+						return "Deny";
+					},
+				},
+			},
+		);
+		assert.equal(result?.block, true);
+		assert.match(title, /Hint: This may discard changes/);
+	} finally {
+		if (previous === undefined) {
+			delete (globalThis as Record<symbol, unknown>)[HINT_SERVICE_KEY];
+		} else {
+			(globalThis as Record<symbol, unknown>)[HINT_SERVICE_KEY] = previous;
+		}
 	}
 });
 
